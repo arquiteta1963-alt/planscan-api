@@ -4,8 +4,9 @@ import cv2
 import numpy as np
 import base64
 import uuid
+import math
 
-app = FastAPI(title="PlanScan API")
+app = FastAPI(title="PlanScan API - Geometry Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,94 +18,112 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "PlanScan API ativa com OpenCV + merge"}
+    return {"status": "ok", "message": "PlanScan API ativa - OpenCV + Geometry Engine"}
 
 def image_to_base64(image):
     _, buffer = cv2.imencode(".png", image)
     return "data:image/png;base64," + base64.b64encode(buffer).decode("utf-8")
 
-def detect_lines(image):
+def preprocess_image(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
     gray = cv2.equalizeHist(gray)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+    thresh = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        10
+    )
 
     kernel = np.ones((3, 3), np.uint8)
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    clean = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    clean = cv2.morphologyEx(clean, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    edges = cv2.Canny(thresh, 50, 150)
+    return clean
+
+def detect_raw_lines(binary):
+    edges = cv2.Canny(binary, 50, 150)
 
     lines = cv2.HoughLinesP(
         edges,
         rho=1,
         theta=np.pi / 180,
-        threshold=100,
-        minLineLength=80,
-        maxLineGap=12,
+        threshold=80,
+        minLineLength=70,
+        maxLineGap=18
     )
 
-    detected = []
+    result = []
 
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-
-            dx = abs(x2 - x1)
-            dy = abs(y2 - y1)
-            length = np.hypot(dx, dy)
-
-            if length < 80:
-                continue
-
-            # manter apenas linhas quase horizontais ou verticais
-            if dx > 12 and dy > 12:
-                continue
-
-            if dx >= dy:
-                y = int((y1 + y2) / 2)
-                x_start = min(x1, x2)
-                x_end = max(x1, x2)
-                detected.append({
-                    "id": f"wall_{len(detected) + 1}",
-                    "x1": int(x_start),
-                    "y1": y,
-                    "x2": int(x_end),
-                    "y2": y,
-                    "orientation": "horizontal",
-                    "type": "wall",
-                    "confidence": 0.85,
-                })
-            else:
-                x = int((x1 + x2) / 2)
-                y_start = min(y1, y2)
-                y_end = max(y1, y2)
-                detected.append({
-                    "id": f"wall_{len(detected) + 1}",
-                    "x1": x,
-                    "y1": int(y_start),
-                    "x2": x,
-                    "y2": int(y_end),
-                    "orientation": "vertical",
-                    "type": "wall",
-                    "confidence": 0.85,
-                })
-
-    return detected
-
-def merge_lines(lines, threshold=20):
-    merged = []
+    if lines is None:
+        return result
 
     for line in lines:
-        added = False
+        x1, y1, x2, y2 = line[0]
 
-        for m in merged:
-            if line["orientation"] != m["orientation"]:
-                continue
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.sqrt(dx * dx + dy * dy)
 
-            if line["orientation"] == "horizontal":
-                if abs(line["y1"] - m["y1"]) <= threshold:
-                    if not (line["x2"] < m["x1"] - threshold or line["x1"] > m["x2"] + threshold):
+        if length < 70:
+            continue
+
+        angle = abs(math.degrees(math.atan2(dy, dx)))
+
+        # Snap horizontal / vertical
+        if angle < 12 or angle > 168:
+            y = int((y1 + y2) / 2)
+            result.append({
+                "x1": int(min(x1, x2)),
+                "y1": y,
+                "x2": int(max(x1, x2)),
+                "y2": y,
+                "orientation": "horizontal",
+                "type": "wall"
+            })
+
+        elif 78 < angle < 102:
+            x = int((x1 + x2) / 2)
+            result.append({
+                "x1": x,
+                "y1": int(min(y1, y2)),
+                "x2": x,
+                "y2": int(max(y1, y2)),
+                "orientation": "vertical",
+                "type": "wall"
+            })
+
+    return result
+
+def merge_lines(lines, axis_threshold=18, gap_threshold=45):
+    horizontals = [l for l in lines if l["orientation"] == "horizontal"]
+    verticals = [l for l in lines if l["orientation"] == "vertical"]
+
+    def merge_group(group, orientation):
+        if not group:
+            return []
+
+        if orientation == "horizontal":
+            group.sort(key=lambda l: (l["y1"], l["x1"]))
+        else:
+            group.sort(key=lambda l: (l["x1"], l["y1"]))
+
+        merged = []
+
+        for line in group:
+            added = False
+
+            for m in merged:
+                if orientation == "horizontal":
+                    same_axis = abs(line["y1"] - m["y1"]) <= axis_threshold
+                    overlapping = not (
+                        line["x1"] > m["x2"] + gap_threshold or
+                        line["x2"] < m["x1"] - gap_threshold
+                    )
+
+                    if same_axis and overlapping:
                         m["x1"] = min(m["x1"], line["x1"])
                         m["x2"] = max(m["x2"], line["x2"])
                         m["y1"] = int((m["y1"] + line["y1"]) / 2)
@@ -112,9 +131,14 @@ def merge_lines(lines, threshold=20):
                         added = True
                         break
 
-            if line["orientation"] == "vertical":
-                if abs(line["x1"] - m["x1"]) <= threshold:
-                    if not (line["y2"] < m["y1"] - threshold or line["y1"] > m["y2"] + threshold):
+                else:
+                    same_axis = abs(line["x1"] - m["x1"]) <= axis_threshold
+                    overlapping = not (
+                        line["y1"] > m["y2"] + gap_threshold or
+                        line["y2"] < m["y1"] - gap_threshold
+                    )
+
+                    if same_axis and overlapping:
                         m["y1"] = min(m["y1"], line["y1"])
                         m["y2"] = max(m["y2"], line["y2"])
                         m["x1"] = int((m["x1"] + line["x1"]) / 2)
@@ -122,15 +146,26 @@ def merge_lines(lines, threshold=20):
                         added = True
                         break
 
-        if not added:
-            merged.append(line.copy())
+            if not added:
+                merged.append(line.copy())
 
-    for i, wall in enumerate(merged):
-        wall["id"] = f"wall_{i + 1}"
+        return merged
 
-    return merged
+    merged = merge_group(horizontals, "horizontal") + merge_group(verticals, "vertical")
 
-def make_svg(width, height, walls):
+    cleaned = []
+    for line in merged:
+        length = abs(line["x2"] - line["x1"]) if line["orientation"] == "horizontal" else abs(line["y2"] - line["y1"])
+        if length >= 60:
+            cleaned.append(line)
+
+    for i, line in enumerate(cleaned):
+        line["id"] = f"wall_{i+1}"
+        line["confidence"] = 0.9
+
+    return cleaned
+
+def build_svg(width, height, walls):
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="white"/>'
@@ -138,15 +173,14 @@ def make_svg(width, height, walls):
 
     for wall in walls:
         svg.append(
-            f'<line x1="{wall["x1"]}" y1="{wall["y1"]}" '
-            f'x2="{wall["x2"]}" y2="{wall["y2"]}" '
-            f'stroke="black" stroke-width="3" stroke-linecap="round"/>'
+            f'<line x1="{wall["x1"]}" y1="{wall["y1"]}" x2="{wall["x2"]}" y2="{wall["y2"]}" '
+            f'stroke="black" stroke-width="5" stroke-linecap="square"/>'
         )
 
     svg.append("</svg>")
     return "".join(svg)
 
-def make_preview(image, walls):
+def build_preview(image, walls):
     preview = image.copy()
 
     for wall in walls:
@@ -155,7 +189,7 @@ def make_preview(image, walls):
             (wall["x1"], wall["y1"]),
             (wall["x2"], wall["y2"]),
             (0, 0, 255),
-            2
+            3
         )
 
     return preview
@@ -169,30 +203,31 @@ async def processar_planta(file: UploadFile = File(...)):
     if image is None:
         return {
             "status": "error",
-            "message": "Não foi possível ler a imagem enviada."
+            "message": "Imagem inválida."
         }
 
     height, width = image.shape[:2]
 
-    raw_lines = detect_lines(image)
-    walls = merge_lines(raw_lines, threshold=20)
+    binary = preprocess_image(image)
+    raw_lines = detect_raw_lines(binary)
+    walls = merge_lines(raw_lines)
 
-    svg = make_svg(width, height, walls)
-    preview = make_preview(image, walls)
+    svg = build_svg(width, height, walls)
+    preview = build_preview(image, walls)
 
     return {
         "status": "success",
         "id": str(uuid.uuid4()),
         "width": width,
         "height": height,
-        "rooms": [],
+        "raw_count": len(raw_lines),
+        "wall_count": len(walls),
         "walls": walls,
         "doors": [],
         "windows": [],
-        "uncertain": [],
-        "summary": f"{len(raw_lines)} linhas brutas detectadas; {len(walls)} paredes após merge.",
+        "rooms": [],
         "svg": svg,
         "preview_base64": image_to_base64(preview),
-        "unit": "cm",
-        "scale": "1:50",
+        "summary": f"{len(raw_lines)} linhas detectadas; {len(walls)} paredes consolidadas.",
+        "engine": "opencv_geometry_v1"
     }
