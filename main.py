@@ -1,10 +1,9 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
+import cv2
+import numpy as np
 import base64
-import os
-import json
-import re
+import uuid
 
 app = FastAPI(title="PlanScan API")
 
@@ -16,165 +15,124 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "PlanScan API ativa"}
+    return {"status": "ok", "message": "PlanScan API ativa com OpenCV"}
 
 
-def extract_json(text: str):
-    text = text.strip()
-    text = re.sub(r"^```json", "", text)
-    text = re.sub(r"^```", "", text)
-    text = re.sub(r"```$", "", text)
-    return json.loads(text.strip())
+def image_to_base64(image):
+    _, buffer = cv2.imencode(".png", image)
+    return "data:image/png;base64," + base64.b64encode(buffer).decode("utf-8")
 
 
-def make_svg(data):
-    rooms = data.get("rooms", [])
-    walls = data.get("walls", [])
-    doors = data.get("doors", [])
-    windows = data.get("windows", [])
+def detect_lines(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
+    # melhora contraste
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # detecta bordas
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    # detecta linhas
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=80,
+        minLineLength=45,
+        maxLineGap=12,
+    )
+
+    detected = []
+
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+
+            length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+
+            if length < 40:
+                continue
+
+            detected.append({
+                "id": f"wall_{len(detected) + 1}",
+                "x1": int(x1),
+                "y1": int(y1),
+                "x2": int(x2),
+                "y2": int(y2),
+                "type": "detected_line",
+                "confidence": 0.65
+            })
+
+    return detected
+
+
+def make_svg(width, height, walls):
     svg = [
-        '<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="700" viewBox="0 0 1000 700">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="white"/>'
     ]
 
     for wall in walls:
-        x1 = wall.get("x1", 0)
-        y1 = wall.get("y1", 0)
-        x2 = wall.get("x2", 0)
-        y2 = wall.get("y2", 0)
-        svg.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="black" stroke-width="6" stroke-linecap="square"/>')
-
-    for door in doors:
-        x = door.get("x", 0)
-        y = door.get("y", 0)
-        w = door.get("width", 45)
-        svg.append(f'<path d="M{x},{y} A{w},{w} 0 0 1 {x+w},{y+w}" fill="none" stroke="black" stroke-width="3"/>')
-
-    for window in windows:
-        x1 = window.get("x1", 0)
-        y1 = window.get("y1", 0)
-        x2 = window.get("x2", 0)
-        y2 = window.get("y2", 0)
-        svg.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#2563eb" stroke-width="4"/>')
-
-    for room in rooms:
-        name = room.get("name", "Ambiente")
-        x = room.get("label_x", 100)
-        y = room.get("label_y", 100)
-        svg.append(f'<text x="{x}" y="{y}" font-family="Arial" font-size="22" text-anchor="middle" fill="#111">{name}</text>')
+        svg.append(
+            f'<line x1="{wall["x1"]}" y1="{wall["y1"]}" '
+            f'x2="{wall["x2"]}" y2="{wall["y2"]}" '
+            f'stroke="black" stroke-width="3" stroke-linecap="round"/>'
+        )
 
     svg.append("</svg>")
     return "".join(svg)
 
 
+def make_preview(image, walls):
+    preview = image.copy()
+
+    for wall in walls:
+        cv2.line(
+            preview,
+            (wall["x1"], wall["y1"]),
+            (wall["x2"], wall["y2"]),
+            (0, 0, 255),
+            2
+        )
+
+    return preview
+
+
 @app.post("/processar-planta")
 async def processar_planta(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    file_bytes = await file.read()
 
-    prompt = """
-Você é uma IA especializada em leitura de plantas baixas arquitetônicas desenhadas à mão.
+    np_array = np.frombuffer(file_bytes, np.uint8)
+    image = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
 
-Analise a imagem e retorne SOMENTE JSON válido, sem markdown e sem explicações.
-
-Objetivo:
-Criar uma primeira versão vetorial editável da planta.
-
-Retorne obrigatoriamente neste formato:
-
-{
-  "status": "success",
-  "summary": "",
-  "rooms": [
-    {
-      "id": "room_1",
-      "name": "Bedroom",
-      "type": "quarto",
-      "label_x": 200,
-      "label_y": 200,
-      "confidence": 0.8
-    }
-  ],
-  "walls": [
-    {
-      "id": "wall_1",
-      "x1": 100,
-      "y1": 100,
-      "x2": 500,
-      "y2": 100,
-      "type": "external",
-      "confidence": 0.8
-    }
-  ],
-  "doors": [
-    {
-      "id": "door_1",
-      "x": 200,
-      "y": 300,
-      "width": 45,
-      "swing": "left",
-      "confidence": 0.7
-    }
-  ],
-  "windows": [
-    {
-      "id": "window_1",
-      "x1": 300,
-      "y1": 100,
-      "x2": 380,
-      "y2": 100,
-      "confidence": 0.7
-    }
-  ],
-  "uncertain": [],
-  "scale": "1:50",
-  "unit": "m"
-}
-
-Regras:
-- Use coordenadas aproximadas em um canvas 1000x700.
-- Não invente medidas reais.
-- Se algo estiver incerto, coloque em "uncertain".
-- Priorize paredes externas, divisórias principais, portas, janelas e nomes dos cômodos.
-- As coordenadas precisam permitir gerar um SVG visual aproximado.
-"""
-
-    response = client.responses.create(
-        model="gpt-4.1",
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:image/jpeg;base64,{image_base64}"
-                    }
-                ]
-            }
-        ]
-    )
-
-    raw_text = response.output_text.strip()
-
-    try:
-        data = extract_json(raw_text)
-    except Exception:
+    if image is None:
         return {
             "status": "error",
-            "message": "A IA respondeu, mas não retornou JSON válido.",
-            "raw": raw_text
+            "message": "Não foi possível ler a imagem enviada."
         }
 
-    if data.get("status") != "success":
-        data["status"] = "success"
+    height, width = image.shape[:2]
 
-    data["svg"] = make_svg(data)
+    walls = detect_lines(image)
+    svg = make_svg(width, height, walls)
+    preview = make_preview(image, walls)
 
-    return data
+    return {
+        "status": "success",
+        "id": str(uuid.uuid4()),
+        "width": width,
+        "height": height,
+        "rooms": [],
+        "walls": walls,
+        "doors": [],
+        "windows": [],
+        "uncertain": [],
+        "summary": f"{len(walls)} linhas detectadas por OpenCV.",
+        "svg": svg,
+        "preview_base64": image_to_base64(preview),
+        "unit": "cm",
+        "scale": "1:50"
+    }
