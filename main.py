@@ -24,12 +24,14 @@ async def processar_planta(file: UploadFile = File(...)):
                 "content": [
                     {"type": "input_text", "text": "Analise esta planta baixa e retorne um JSON estruturado com: paredes, portas, cômodos e layout."},
                     {
-                        "type": "input_image",
-                        "image_base64": image_base64
+                        {
+    "type": "input_image",
+    "image_url": f"data:image/jpeg;base64,{image_base64}"
+}
                     }
                 ]
             }
         ]
     )
 
-    return {"resultado": response.output[0].content[0].text}
+ return {"resultado": response.output_text}
