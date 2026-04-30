@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 import base64
 import os
+import json
 
 app = FastAPI(title="PlanScan API")
 
@@ -34,21 +35,34 @@ async def processar_planta(file: UploadFile = File(...)):
                     {
                         "type": "input_text",
                         "text": """
-Analise esta imagem de planta baixa desenhada à mão.
+Analise esta planta baixa desenhada à mão.
 
-Retorne APENAS um JSON válido com:
+Retorne SOMENTE JSON válido, sem markdown, sem explicação.
+
+Formato obrigatório:
 {
-  "ambientes": [],
-  "portas": [],
-  "janelas": [],
-  "escadas": [],
-  "paredes": [],
+  "status": "success",
+  "ambientes": [
+    {"nome": "", "tipo": "", "observacao": ""}
+  ],
+  "portas": [
+    {"local": "", "observacao": ""}
+  ],
+  "janelas": [
+    {"local": "", "observacao": ""}
+  ],
+  "escadas": [
+    {"local": "", "observacao": ""}
+  ],
+  "paredes": [
+    {"descricao": "", "observacao": ""}
+  ],
   "observacoes": [],
   "resumo": ""
 }
 
-Identifique cômodos, portas, escadas, paredes principais, janelas e problemas visíveis.
-Não invente medidas exatas. Se algo estiver incerto, marque como "incerto".
+Se algo estiver incerto, escreva "incerto".
+Não invente medidas exatas.
 """
                     },
                     {
@@ -60,4 +74,15 @@ Não invente medidas exatas. Se algo estiver incerto, marque como "incerto".
         ]
     )
 
-    return {"resultado": response.output_text}
+    texto = response.output_text.strip()
+
+    try:
+        resultado = json.loads(texto)
+    except Exception:
+        resultado = {
+            "status": "error",
+            "raw": texto,
+            "message": "A IA respondeu, mas não em JSON válido."
+        }
+
+    return resultado
